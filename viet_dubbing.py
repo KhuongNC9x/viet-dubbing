@@ -424,6 +424,32 @@ async def main():
     console.print("[dim]  --bgm-volume 0        Mute original audio completely[/]")
     console.print()
 
+    # ── NOTIFICATION SOUND ──────────────────────────────────
+    play_done_sound()
+
+
+def play_done_sound():
+    """Play a beep sound to notify completion."""
+    try:
+        if sys.platform == "win32":
+            # Windows
+            import winsound
+            # 10 short beeps: 800Hz frequency, 150ms each.
+            for _ in range(10):
+                winsound.Beep(800, 150)
+                import time; time.sleep(0.08)
+        elif sys.platform == "darwin":
+            # macOS
+            os.system("afplay /System/Library/Sounds/Glass.aiff &")
+        else:
+            # Linux
+            os.system("paplay /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null "
+                      "|| (command -v beep >/dev/null && beep) "
+                      "|| printf '\\a'")
+    except Exception:
+        # Fallback: terminal bell
+        print("\a", end="", flush=True)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
