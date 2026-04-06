@@ -77,6 +77,54 @@ if missing:
 console = Console()
 
 # ============================================================
+# LOGGER
+# ============================================================
+
+class DailyLogger:
+    """
+    Ghi log vào file logs/log_YYYYMMDD.txt, nhóm theo ngày.
+    Mỗi dòng có timestamp đầy đủ: [HH:MM:SS] LEVEL  message
+    """
+    LOG_DIR = "logs"
+
+    def __init__(self):
+        os.makedirs(self.LOG_DIR, exist_ok=True)
+        today     = datetime.now().strftime("%Y%m%d")
+        self.path = os.path.join(self.LOG_DIR, f"log_{today}.txt")
+        self._f   = open(self.path, "a", encoding="utf-8", buffering=1)
+        # Ghi header phân cách nếu file đã có nội dung
+        if self._f.tell() > 0:
+            self._write_raw("")
+        self._write_raw(f"{'='*60}")
+        self._write_raw(f"  SESSION START  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self._write_raw(f"{'='*60}")
+
+    def _write_raw(self, text: str):
+        self._f.write(text + "\n")
+        self._f.flush()
+
+    def _write(self, level: str, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._write_raw(f"[{ts}] {level:<7} {msg}")
+
+    def info(self,    msg: str): self._write("INFO",    msg)
+    def success(self, msg: str): self._write("OK",      msg)
+    def warning(self, msg: str): self._write("WARNING", msg)
+    def error(self,   msg: str): self._write("ERROR",   msg)
+    def section(self, title: str):
+        self._write_raw("")
+        self._write_raw(f"── {title} {'─' * max(0, 50 - len(title))}")
+
+    def close(self):
+        self._write_raw(f"{'='*60}")
+        self._write_raw(f"  SESSION END    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self._write_raw(f"{'='*60}\n")
+        self._f.close()
+
+# Global logger instance (khởi tạo trong main)
+logger: DailyLogger = None
+
+# ============================================================
 # VOICE LIST
 # ============================================================
 VOICES = {
@@ -148,9 +196,13 @@ async def tts_one(cue: dict, out_path: str, voice: str) -> bool:
             await comm.save(out_path)
             if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                 return True
-        except Exception:
+        except Exception as e:
+            if logger:
+                logger.warning(f"TTS cue #{cue['index']} attempt {attempt}/{RETRY_COUNT} failed: {e}")
             if attempt < RETRY_COUNT:
                 await asyncio.sleep(RETRY_DELAY)
+    if logger:
+        logger.error(f"TTS cue #{cue['index']} FAILED after {RETRY_COUNT} attempts | text: {cue['text'][:60]}")
     return False
 
 
@@ -426,6 +478,56 @@ def format_duration(seconds: float) -> str:
     return f"{m}m {s:02d}s" if m > 0 else f"{s}s"
 
 
+def timed_progress(label: str, color: str, fn, estimated_sec: float = 30):
+    """
+    Run fn() in a background thread while showing a timed progress bar.
+    The bar fills based on estimated_sec; snaps to 100% when fn() finishes.
+    Returns fn()'s return value.
+    """
+    import threading
+
+    result_box = [None]
+    exc_box    = [None]
+
+    def _run():
+        try:
+            result_box[0] = fn()
+        except Exception as e:
+            exc_box[0] = e
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    interval   = 0.25          # update every 250 ms
+    total_ticks = int(estimated_sec / interval)
+
+    with Progress(
+        SpinnerColumn(spinner_name="dots", style=color),
+        TextColumn(f"[bold {color}]{label}[/]"),
+        BarColumn(bar_width=32, style=color, complete_style="bright_green"),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        task = progress.add_task("work", total=total_ticks)
+        elapsed = 0
+
+        while thread.is_alive():
+            _time.sleep(interval)
+            elapsed += 1
+            # Ease toward 95% while still running, never reach 100% artificially
+            if elapsed < total_ticks * 0.95:
+                progress.advance(task)
+
+        # Snap to 100% once done
+        progress.update(task, completed=total_ticks)
+
+    if exc_box[0]:
+        raise exc_box[0]
+    return result_box[0]
+
+
 def play_done_sound():
     """Phát âm thanh beep thông báo hoàn thành."""
     try:
@@ -465,6 +567,20 @@ async def main():
     video_out  = args.out if args.out else make_output_name(base_name)
     audio_out  = make_output_name(base_name, suffix="audio")
 
+    # ── INIT LOGGER ─────────────────────────────────────────
+    global logger
+    logger = DailyLogger()
+    logger.section("SESSION CONFIG")
+    logger.info(f"SRT file    : {args.srt}")
+    logger.info(f"Video file  : {args.video or '(none)'}")
+    logger.info(f"Voice       : {voice_label}")
+    logger.info(f"BGM volume  : {args.bgm_volume}%")
+    logger.info(f"Workers     : {workers} concurrent")
+    logger.info(f"Audio only  : {args.audio_only}")
+    logger.info(f"Output video: {video_out}")
+    logger.info(f"Output audio: {audio_out}")
+    logger.info(f"Log file    : {logger.path}")
+
     # ── HEADER ──────────────────────────────────────────────
     console.print()
     console.rule("[bold cyan]VIET DUBBING v2 — Performance Edition[/]")
@@ -488,11 +604,15 @@ async def main():
 
     if not cues:
         console.print("[red]ERROR: Could not parse subtitle file.[/]")
+        logger.error("Could not parse SRT file — aborting")
+        logger.close()
         return
 
     duration_str = format_duration(cues[-1]["end"])
     console.print(f"[green]✓[/] Found [bold]{len(cues)}[/] subtitle lines  "
                   f"[dim](duration ~{duration_str})[/]\n")
+    logger.section("READ SRT")
+    logger.success(f"Parsed {len(cues)} subtitle lines, duration ~{duration_str}")
 
     # ── VIDEO DURATION ──────────────────────────────────────
     if args.video and os.path.exists(args.video):
@@ -508,16 +628,20 @@ async def main():
     else:
         total_sec = cues[-1]["end"] + 2
     total_ms = int(total_sec * 1000)
+    logger.info(f"Total duration: {format_duration(total_sec)} ({total_ms} ms)")
 
     tmp_dir = "tts_tmp"
     t_start = _time.perf_counter()
 
     # ── GENERATE TTS (concurrent) ───────────────────────────
+    logger.section("GENERATE TTS")
+    logger.info(f"Starting TTS generation — {len(cues)} cues, {workers} workers, voice={voice_id}")
     tts_paths, success, fail, skipped = await generate_all_tts(
         cues, tmp_dir, voice_id, max_workers=workers
     )
 
     t_tts = _time.perf_counter()
+    logger.success(f"TTS done in {format_duration(t_tts - t_start)} — succeeded={success}, skipped={skipped}, failed={fail}")
 
     summary = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
     summary.add_column(style="dim", width=20)
@@ -530,31 +654,60 @@ async def main():
     console.print()
 
     # ── SYNC TIMELINE (numpy + parallel stretch) ────────────
+    logger.section("SYNC TIMELINE")
+    logger.info("Building TTS track with timeline sync + parallel stretch")
     tts_track, synced = build_tts_track(cues, tts_paths, total_ms)
     t_sync = _time.perf_counter()
     console.print(f"\n[green]✓[/] Synced [bold]{synced}[/] segments  "
                   f"[dim]({format_duration(t_sync - t_tts)})[/]\n")
+    logger.success(f"Timeline sync done in {format_duration(t_sync - t_tts)} — {synced} segments synced")
 
     # ── MIX WITH BGM ────────────────────────────────────────
     final_track = tts_track
     if args.video and os.path.exists(args.video) and not args.audio_only:
-        with console.status("[magenta]Mixing with original audio...[/]"):
-            final_track = mix_with_bgm(args.video, tts_track, args.bgm_volume, total_ms, tmp_dir)
+        logger.section("MIX BGM")
+        logger.info(f"Mixing TTS with original audio — BGM volume: {args.bgm_volume}%")
+        est_mix = max(10, total_ms / 1000 * 0.05)
+        final_track = timed_progress(
+            "Mixing BGM", "magenta",
+            lambda: mix_with_bgm(args.video, tts_track, args.bgm_volume, total_ms, tmp_dir),
+            estimated_sec=est_mix,
+        )
+        t_mix = _time.perf_counter()
         console.print(f"[green]✓[/] Audio mixed  [dim](BGM: {args.bgm_volume}%)[/]\n")
+        logger.success(f"BGM mix done in {format_duration(t_mix - t_sync)}")
 
     # ── EXPORT AUDIO ────────────────────────────────────────
-    with console.status("[yellow]Exporting audio...[/]"):
-        final_track.export(audio_out, format="mp3", bitrate="192k")
+    logger.section("EXPORT AUDIO")
+    logger.info(f"Exporting audio → {audio_out}")
+    t_before_export = _time.perf_counter()
+    est_export = max(5, total_ms / 1000 * 0.02)
+    timed_progress(
+        "Exporting audio", "yellow",
+        lambda: final_track.export(audio_out, format="mp3", bitrate="192k"),
+        estimated_sec=est_export,
+    )
+    t_export = _time.perf_counter()
     console.print(f"[green]✓[/] Audio exported: [bold]{audio_out}[/]\n")
+    logger.success(f"Audio exported in {format_duration(t_export - t_before_export)} → {audio_out}")
 
     # ── MUX VIDEO ───────────────────────────────────────────
     if not args.audio_only and args.video and os.path.exists(args.video):
-        with console.status("[yellow]Muxing audio into video...[/]"):
-            ok = mux_to_video(args.video, audio_out, video_out)
+        logger.section("MUX VIDEO")
+        logger.info(f"Muxing audio into video → {video_out}")
+        est_mux = max(10, total_ms / 1000 * 0.03)
+        ok = timed_progress(
+            "Muxing video", "yellow",
+            lambda: mux_to_video(args.video, audio_out, video_out),
+            estimated_sec=est_mux,
+        )
+        t_mux = _time.perf_counter()
         if ok:
             console.print(f"[green]✓[/] Video muxed: [bold]{video_out}[/]\n")
+            logger.success(f"Video muxed in {format_duration(t_mux - t_export)} → {video_out}")
         else:
             console.print(f"[red]✗[/] Video mux failed. Check FFmpeg installation.\n")
+            logger.error("Video mux FAILED — check FFmpeg installation")
 
     # ── CLEANUP ─────────────────────────────────────────────
     if os.path.exists(tmp_dir):
@@ -574,7 +727,16 @@ async def main():
     result.add_row("Audio output", audio_out)
     result.add_row("Lines synced", str(synced))
     result.add_row("Total time",   format_duration(t_total))
+    result.add_row("Log file",     logger.path)
     console.print(result)
+
+    logger.section("FINAL SUMMARY")
+    logger.success(f"All done in {format_duration(t_total)}")
+    if not args.audio_only and args.video:
+        logger.info(f"Video output : {video_out}")
+    logger.info(f"Audio output : {audio_out}")
+    logger.info(f"Lines synced : {synced}/{len(cues)}")
+    logger.close()
 
     console.print()
     console.print("[dim]Tips:[/]")
