@@ -156,7 +156,12 @@ def make_output_name(video_path: str, suffix: str = "") -> str:
 
 def parse_srt_time(t: str) -> float:
     h, m, s_ms = t.strip().split(":")
-    s, ms = s_ms.split(",")
+    if "," in s_ms:
+        s, ms = s_ms.split(",")
+    elif "." in s_ms:
+        s, ms = s_ms.split(".")
+    else:
+        s, ms = s_ms, "0"
     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
 
 
@@ -678,18 +683,24 @@ async def main():
         logger.success(f"BGM mix done in {format_duration(t_mix - t_sync)}")
 
     # ── EXPORT AUDIO ────────────────────────────────────────
+    # Nếu có video thì chỉ dùng mp3 làm file trung gian tạm, xóa sau khi mux
+    # Nếu không có video (audio-only) thì giữ lại file mp3 output
+    is_intermediate = (not args.audio_only and args.video and os.path.exists(args.video))
+    export_path = audio_out  # giữ nguyên tên nếu audio-only
+
     logger.section("EXPORT AUDIO")
-    logger.info(f"Exporting audio → {audio_out}")
+    logger.info(f"Exporting audio → {export_path}")
     t_before_export = _time.perf_counter()
     est_export = max(5, total_ms / 1000 * 0.02)
     timed_progress(
         "Exporting audio", "yellow",
-        lambda: final_track.export(audio_out, format="mp3", bitrate="192k"),
+        lambda: final_track.export(export_path, format="mp3", bitrate="192k"),
         estimated_sec=est_export,
     )
     t_export = _time.perf_counter()
-    console.print(f"[green]✓[/] Audio exported: [bold]{audio_out}[/]\n")
-    logger.success(f"Audio exported in {format_duration(t_export - t_before_export)} → {audio_out}")
+    if not is_intermediate:
+        console.print(f"[green]✓[/] Audio exported: [bold]{export_path}[/]\n")
+    logger.success(f"Audio exported in {format_duration(t_export - t_before_export)} → {export_path}")
 
     # ── MUX VIDEO ───────────────────────────────────────────
     if not args.audio_only and args.video and os.path.exists(args.video):
@@ -698,10 +709,13 @@ async def main():
         est_mux = max(10, total_ms / 1000 * 0.03)
         ok = timed_progress(
             "Muxing video", "yellow",
-            lambda: mux_to_video(args.video, audio_out, video_out),
+            lambda: mux_to_video(args.video, export_path, video_out),
             estimated_sec=est_mux,
         )
         t_mux = _time.perf_counter()
+        # Xóa file mp3 trung gian sau khi mux xong
+        if os.path.exists(export_path):
+            os.remove(export_path)
         if ok:
             console.print(f"[green]✓[/] Video muxed: [bold]{video_out}[/]\n")
             logger.success(f"Video muxed in {format_duration(t_mux - t_export)} → {video_out}")
@@ -710,8 +724,8 @@ async def main():
             logger.error("Video mux FAILED — check FFmpeg installation")
 
     # ── CLEANUP ─────────────────────────────────────────────
-    if os.path.exists(tmp_dir):
-        shutil.rmtree(tmp_dir)
+    #if os.path.exists(tmp_dir):
+    #    shutil.rmtree(tmp_dir)
 
     # ── FINAL SUMMARY ───────────────────────────────────────
     t_total = _time.perf_counter() - t_start
@@ -724,7 +738,8 @@ async def main():
     result.add_column(style="bold white")
     if not args.audio_only and args.video:
         result.add_row("Video output", video_out)
-    result.add_row("Audio output", audio_out)
+    else:
+        result.add_row("Audio output", audio_out)
     result.add_row("Lines synced", str(synced))
     result.add_row("Total time",   format_duration(t_total))
     result.add_row("Log file",     logger.path)
@@ -734,7 +749,8 @@ async def main():
     logger.success(f"All done in {format_duration(t_total)}")
     if not args.audio_only and args.video:
         logger.info(f"Video output : {video_out}")
-    logger.info(f"Audio output : {audio_out}")
+    else:
+        logger.info(f"Audio output : {audio_out}")
     logger.info(f"Lines synced : {synced}/{len(cues)}")
     logger.close()
 
