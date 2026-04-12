@@ -114,14 +114,14 @@ python viet_dubbing.py --srt subtitle.srt --video no_voice.mp4
 
 ### All Parameters
 
-| Parameter      | Required | Default  | Description                                          |
-|----------------|----------|----------|------------------------------------------------------|
-| `--srt`        | ✅ Yes   | —        | Path to Vietnamese `.srt` subtitle file              |
-| `--video`      | ❌ No    | (none)   | Path to video file (with voice already removed)      |
-| `--voice`      | ❌ No    | `female` | Voice to use: `female` or `male`                     |
-| `--bgm-volume` | ❌ No    | `100`    | Original audio volume to keep (0–100%)               |
-| `--out`        | ❌ No    | auto     | Custom output filename (auto-generated if not set)   |
-| `--audio-only` | ❌ No    | false    | Export `.mp3` only, skip video muxing                |
+| Parameter      | Required | Default  | Description                                             |
+|----------------|----------|----------|---------------------------------------------------------|
+| `--srt`        | ✅ Yes   | —        | Path to Vietnamese `.srt` subtitle file                 |
+| `--video`      | ❌ No    | (none)   | Path to video file (with voice already removed)         |
+| `--voice`      | ❌ No    | `female` | Voice to use: `female` or `male`                        |
+| `--bgm-volume` | ❌ No    | `100`    | Original audio volume to keep (0–100%)                  |
+| `--out`        | ❌ No    | auto     | Custom output filename (auto-generated if not set)      |
+| `--audio-only` | ❌ No    | false    | Export `.mp3` only, skip video muxing                   |
 | `--workers`    | ❌ No    | `5`      | Number of concurrent TTS requests (max recommended: 10) |
 
 ---
@@ -203,6 +203,51 @@ Output files are automatically named after the source video + timestamp:
 - Copy `.srt` + `.mp4` + `viet_dubbing.py` into the same folder
 - Run `python viet_dubbing.py --srt ... --video ...`
 - Collect output file from the same folder
+
+---
+
+## 🔁 Handling Failed TTS Lines
+
+If some subtitle lines fail to generate (network hiccup, rate limit), use the companion script `retry_failed_tts.py` to fix them without re-running the entire job.
+
+### Step-by-step
+
+**Step 1** — Keep the `tts_tmp/` cache folder after the main run.
+
+In `viet_dubbing.py`, find and comment out the cleanup line:
+
+```python
+# shutil.rmtree(tmp_dir)   ← comment this out
+```
+
+**Step 2** — Run the retry script to regenerate only the failed lines:
+
+```
+python retry_failed_tts.py --srt subtitle.srt
+```
+
+The script automatically detects failed cues by reading the latest log in `logs/`, then saves the retried audio files directly into `tts_tmp/`.
+
+**Step 3** — Re-run the main script. All cached files are skipped automatically, only the final mix is re-done:
+
+```
+python viet_dubbing.py --srt subtitle.srt --video episode01_no_voice.mp4
+```
+
+---
+
+### retry_failed_tts.py Parameters
+
+| Parameter    | Required | Default        | Description                                          |
+|--------------|----------|----------------|------------------------------------------------------|
+| `--srt`      | ✅ Yes   | —              | Same `.srt` file used in the main run                |
+| `--tmp-dir`  | ❌ No    | `tts_tmp`      | TTS cache folder (must match main script)            |
+| `--log`      | ❌ No    | latest in logs/ | Specific log file to read failed cue indices from   |
+| `--voice`    | ❌ No    | `female`       | Must match the voice used in the main run            |
+| `--workers`  | ❌ No    | `3`            | Concurrent requests (keep low to avoid rate limits)  |
+| `--retries`  | ❌ No    | `5`            | Number of retry attempts per failed cue              |
+
+> 💡 If no log file is found, the script falls back to scanning `tts_tmp/` for missing or empty `.mp3` files automatically.
 
 ---
 
