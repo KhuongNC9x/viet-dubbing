@@ -1,4 +1,4 @@
-# 🎙️ Viet Dubbing v3
+# 🎙️ Viet Dubbing v3.1
 
 **Auto Vietnamese dubbing from SRT subtitle using Microsoft Edge TTS**
 
@@ -9,44 +9,29 @@ Automatically generate Vietnamese voice-over from `.srt` subtitle files and sync
 ## ✨ Features
 
 - 🆓 **100% Free** — uses Microsoft Edge TTS (no API key required)
-- 🎙️ **Natural Vietnamese voices** — female & male options
-- ⏱️ **Auto time-sync** — automatically stretches/compresses each audio clip to fit the subtitle timestamp
+- 🎙️ **Natural Vietnamese voices** — female & male options (Southern accent)
+- ⏱️ **Smart speed normalization** — automatically stretches/compresses each audio clip to fit the subtitle timestamp, with both speed-up and slow-down support
 - 🎵 **Preserves original audio** — BGM and sound effects are kept, only voice is replaced
-- ⚡ **High performance** — single-decode pipeline, numpy mixing, parallel stretch
+- ⚡ **Parallel pipeline** — concurrent ffprobe, decode, stretch, and TTS generation
+- 🔧 **Tunable speed limits** — control how fast/slow the TTS voice can be adjusted
 - 📊 **Beautiful CLI progress** — real-time progress bar with rich
-- 🔁 **Auto retry** — retries failed lines automatically
-- ▶️ **Resume support** — if interrupted, continues from where it left off
+- 🔁 **Auto retry** — retries failed lines automatically with exponential backoff
+- ▶️ **Resume support** — if interrupted, continues from where it left off (TTS cache)
 - 🏷️ **Auto output naming** — output file named after source video + timestamp
-- 📂 **Smart TTS caching** — TTS cache folder named after video for easy management
-
----
-
-## 🔄 What's new in v3
-
-| Improvement | Detail |
-|---|---|
-| **Single-decode pipeline** | Mỗi MP3 chỉ decode 1 lần — trước đó decode 2-3 lần/file |
-| **ffprobe duration detect** | Dùng ffprobe lấy duration thay vì full decode ở phase detect |
-| **Numpy BGM mixing** | Thay `pydub.overlay()` bằng numpy vectorized — nhanh hơn 10-50× |
-| **WAV intermediate muxing** | Bỏ double encode MP3→AAC, dùng WAV→AAC encode 1 lần |
-| **ThreadPool stretch** | Thay ProcessPoolExecutor bằng ThreadPool cho I/O-bound FFmpeg |
-| **Chained atempo filter** | Hỗ trợ ratio > 2× hoặc < 0.5× (ví dụ: `atempo=2.0,atempo=1.5` cho 3×) |
-| **BGM cache** | Skip extract BGM nếu file đã tồn tại từ lần chạy trước |
-| **Smart TTS folder** | TTS cache đặt tên theo video (ví dụ: `tts_episode01/`) |
-| **Retry script v4** | Đồng bộ naming, extract helpers, validate args, fix backoff |
+- 📝 **Daily log files** — detailed logs in `logs/` folder for debugging
 
 ---
 
 ## 🔧 Requirements
 
 | Component | Version | Notes |
-|---|---|---|
-| Python | 3.10+ | Must add to PATH during install |
-| FFmpeg | Any | Must add `/bin` folder to PATH manually |
-| edge-tts | Latest | Microsoft TTS library |
-| pydub | 0.25+ | Audio processing library |
-| numpy | Latest | Fast array operations for audio mixing |
-| rich | Latest | CLI progress UI |
+|-----------|---------|-------|
+| Python    | 3.10+   | Must add to PATH during install |
+| FFmpeg    | Any     | Must add `/bin` folder to PATH manually |
+| edge-tts  | Latest  | Microsoft TTS library |
+| pydub     | 0.25+   | Audio processing library |
+| numpy     | Latest  | Fast audio mixing |
+| rich      | Latest  | CLI progress UI |
 
 ---
 
@@ -105,19 +90,25 @@ pip install edge-tts pydub rich numpy -i https://pypi.org/simple
         ↓
 4. Run viet_dubbing.py → auto-generate Vietnamese TTS + merge into video
         ↓
-5. Get episode01_dubbed_[timestamp].mp4 ✓
+5. Get output_dubbed_[timestamp].mp4 ✓
 ```
 
 ### Basic Command
 
 ```bash
+# Audio only (minimum required)
+python viet_dubbing.py --srt subtitle.srt
+
+# With video muxing
 python viet_dubbing.py --srt subtitle.srt --video no_voice.mp4
 ```
+
+---
 
 ### All Parameters
 
 | Parameter | Required | Default | Description |
-|---|---|---|---|
+|-----------|----------|---------|-------------|
 | `--srt` | ✅ Yes | — | Path to Vietnamese `.srt` subtitle file |
 | `--video` | ❌ No | (none) | Path to video file (with voice already removed) |
 | `--voice` | ❌ No | `female` | Voice to use: `female` or `male` |
@@ -125,11 +116,14 @@ python viet_dubbing.py --srt subtitle.srt --video no_voice.mp4
 | `--out` | ❌ No | auto | Custom output filename (auto-generated if not set) |
 | `--audio-only` | ❌ No | false | Export `.mp3` only, skip video muxing |
 | `--workers` | ❌ No | `5` | Concurrent TTS requests (max recommended: 10) |
+| `--speed-up-limit` | ❌ No | `2.0` | Max speed-up ratio. Higher = allow faster speech |
+| `--slow-down-limit` | ❌ No | `0.7` | Max slow-down ratio. Lower = allow slower speech |
+| `--no-slow-down` | ❌ No | false | Disable slow-down (v2 behavior) |
 
 ### Available Voices
 
 | Parameter | Voice Name | Gender | Accent |
-|---|---|---|---|
+|-----------|-----------|--------|--------|
 | `--voice female` | HoaiMyNeural | Female | Southern Vietnamese *(default)* |
 | `--voice male` | NamMinhNeural | Male | Southern Vietnamese |
 
@@ -167,10 +161,22 @@ python viet_dubbing.py --srt subtitle.srt --video episode01_no_voice.mp4 --bgm-v
 python viet_dubbing.py --srt subtitle.srt --audio-only
 ```
 
-**Increase TTS concurrency (faster but higher rate limit risk):**
+**Allow faster compression for dense subtitles:**
 
 ```bash
-python viet_dubbing.py --srt subtitle.srt --video episode01_no_voice.mp4 --workers 8
+python viet_dubbing.py --srt subtitle.srt --video video.mp4 --speed-up-limit 2.5
+```
+
+**Allow more stretching for short TTS clips:**
+
+```bash
+python viet_dubbing.py --srt subtitle.srt --video video.mp4 --slow-down-limit 0.6
+```
+
+**Increase TTS concurrency for faster generation:**
+
+```bash
+python viet_dubbing.py --srt subtitle.srt --video video.mp4 --workers 8
 ```
 
 ---
@@ -180,106 +186,41 @@ python viet_dubbing.py --srt subtitle.srt --video episode01_no_voice.mp4 --worke
 Output files are automatically named after the source video + timestamp:
 
 | Type | Example filename |
-|---|---|
+|------|-----------------|
 | Video | `episode01_dubbed_20250115143022.mp4` |
 | Audio | `episode01_audio_20250115143022.mp3` |
-| TTS cache | `tts_episode01/` (folder) |
 
 > Each run produces a unique filename — no risk of overwriting previous outputs.
 
 ---
 
-## 🔁 Retry Failed TTS
+## ⚡ Performance (v3.1 vs v2)
 
-When some TTS cues fail (usually due to rate limiting), use the companion script to retry only the failed ones:
-
-### How it works
-
-```
-1. viet_dubbing.py chạy → một số cue bị lỗi TTS
-        ↓
-2. retry_failed_tts.py → retry chỉ những cue lỗi vào đúng thư mục cache
-        ↓
-3. Chạy lại viet_dubbing.py → skip cue đã có, chỉ mix lại audio
-```
-
-### Commands
-
-```bash
-# Retry cue lỗi (tự tìm log mới nhất + suy ra thư mục từ tên video)
-python retry_failed_tts.py --srt subtitle.srt --video episode01_no_voice.mp4
-
-# Chỉ định thư mục TTS cache cụ thể
-python retry_failed_tts.py --srt subtitle.srt --tmp-dir tts_episode01
-
-# Tùy chỉnh workers và retries
-python retry_failed_tts.py --srt subtitle.srt --video episode01_no_voice.mp4 --workers 2 --retries 8
-
-# Sau khi retry xong, chạy lại viet_dubbing
-python viet_dubbing.py --srt subtitle.srt --video episode01_no_voice.mp4
-```
-
-### Retry Parameters
-
-| Parameter | Required | Default | Description |
-|---|---|---|---|
-| `--srt` | ✅ Yes | — | File SRT gốc |
-| `--video` | ❌ No | (none) | File video gốc (suy ra tên thư mục TTS) |
-| `--tmp-dir` | ❌ No | auto | Thư mục TTS cache (default: `tts_<tên video/srt>`) |
-| `--log` | ❌ No | latest | File log cụ thể (default: log mới nhất trong `logs/`) |
-| `--voice` | ❌ No | `female` | Giọng đọc: `female` hoặc `male` |
-| `--workers` | ❌ No | `3` | Concurrent requests (thấp hơn main script để tránh rate limit) |
-| `--retries` | ❌ No | `5` | Số lần retry mỗi cue (1–20) |
-
-### How it finds failed cues
-
-1. **Đọc log** (ưu tiên): Tìm session cuối trong `logs/log_YYYYMMDD.txt`, lấy danh sách cue `FAILED`
-2. **Scan thư mục** (fallback): Quét `tts_<video>/` tìm file thiếu hoặc file rỗng
+| Phase | v2 | v3.1 | Improvement |
+|-------|------|------|-------------|
+| Detect duration | ffprobe tuần tự | ffprobe song song (ThreadPool) | **~70-80% faster** |
+| Stretch | ProcessPoolExecutor | ThreadPoolExecutor (8 workers) | **Faster startup, less overhead** |
+| Decode MP3 | Tuần tự trong Phase 1 + Phase 2 | Song song (ThreadPool) + single-decode | **~50-60% faster** |
+| BGM mixing | pydub `.overlay()` | Numpy array mixing | **10-50× faster** |
+| BGM extraction | video → MP3 → decode | video → WAV (PCM) trực tiếp | **No encode+decode overhead** |
+| Video mux | Export WAV → FFmpeg đọc file | Pipe raw PCM → FFmpeg stdin | **No temp file I/O** |
 
 ---
 
-## 🏗️ Architecture (v3)
+## 🔄 Speed Normalization (NEW in v3.1)
 
-```
-viet_dubbing.py pipeline:
-┌─────────────────────────────────────────────────────────┐
-│  1. Parse SRT                                           │
-│  2. Generate TTS (async + semaphore concurrency)        │
-│     └─ Cache: tts_<video>/cue_0001.mp3 ...              │
-│  3. Build TTS track                                     │
-│     ├─ Phase 1: ffprobe duration detect (cheap)         │
-│     ├─ Phase 2: ThreadPool stretch (chained atempo)     │
-│     └─ Phase 3: Single decode → numpy array mix         │
-│  4. Mix BGM (numpy vectorized addition)                 │
-│  5. Export MP3 (for user)                               │
-│  6. Mux video: WAV → AAC (single encode)                │
-└─────────────────────────────────────────────────────────┘
-```
+v2 chỉ nén (speed-up) câu TTS dài hơn slot, nhưng **không kéo dãn** câu TTS ngắn hơn slot. Điều này gây ra:
 
-### Performance notes
+- **Câu nói nhanh:** TTS dài 6s cho slot 3s → bị nén gấp đôi, nghe vội
+- **Khoảng im lặng:** TTS ngắn 1s cho slot 3s → nói xong rồi im 2s
+- **Câu bị bỏ qua:** ratio < 0.6 thì không xử lý → audio tràn sang câu kế
 
-- **TTS generation** is network-bound — increase `--workers` for faster generation (watch for rate limits)
-- **Timeline sync** does one ffprobe per clip (fast), stretches in parallel threads, decodes each MP3 exactly once
-- **BGM mixing** uses numpy vectorized `+` operator — handles 30-minute tracks in under 1 second
-- **Video muxing** uses WAV intermediate so audio is encoded to AAC exactly once (no MP3→AAC double encoding)
+v3.1 khắc phục bằng:
 
----
-
-## 📂 Project Structure
-
-```
-viet-dubbing/
-├── viet_dubbing.py           # Main dubbing script (v3)
-├── retry_failed_tts.py       # Retry companion script (v4)
-├── README.md
-├── LICENSE
-├── logs/                     # Auto-generated log files
-│   └── log_20250419.txt
-└── tts_<video>/              # TTS cache (per video)
-    ├── cue_0001.mp3
-    ├── cue_0002.mp3
-    └── ...
-```
+- **Slow-down:** Kéo dãn câu TTS ngắn cho lấp đầy slot (giới hạn mặc định ≥0.7×)
+- **Bỏ COMPRESS_MIN:** Mọi câu đều được xử lý, không còn bị bỏ qua
+- **Tolerance 3%:** Chỉ bỏ qua stretch khi ratio ±3% (thay vì ±5%)
+- **Tùy chỉnh:** `--speed-up-limit` và `--slow-down-limit` cho phép điều chỉnh theo nhu cầu
 
 ---
 
@@ -297,7 +238,6 @@ viet-dubbing/
 - [ ] Remove voice from video using CapCut
 - [ ] Copy `.srt` + `.mp4` + `viet_dubbing.py` into the same folder
 - [ ] Run `python viet_dubbing.py --srt ... --video ...`
-- [ ] If some TTS failed → run `python retry_failed_tts.py --srt ... --video ...` → re-run main script
 - [ ] Collect output file from the same folder
 
 ---
@@ -307,10 +247,10 @@ viet-dubbing/
 - **Interrupted mid-run?** Just run the same command again — the script skips lines already generated and continues from where it stopped.
 - **TTS too loud vs BGM?** Use `--bgm-volume 40` to bring the background music up.
 - **Quick test before full run?** Trim your `.srt` to the first 10 lines and test first.
+- **Speed sounds unnatural?** Try `--speed-up-limit 1.8` for less compression, or `--slow-down-limit 0.8` for less stretching.
+- **Upgrading from v2?** Delete the `tts_tmp/` or `tts_*` cache folder to start fresh. v3.1 uses a different caching structure.
 - **Avoid spaces in filenames** — use `episode_01.mp4` instead of `episode 01.mp4` to prevent path errors.
 - **Internet required** — Edge TTS uses Microsoft's servers to generate voice audio.
-- **Rate limited?** Reduce `--workers` to 3 and wait a few minutes before retrying.
-- **TTS cache reusable** — The `tts_<video>/` folder persists between runs. Delete it manually when no longer needed.
 
 ---
 
