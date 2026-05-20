@@ -1,17 +1,21 @@
 """
 =============================================================
-  RETRY FAILED TTS v4 — Companion script for viet_dubbing.py
+  RETRY FAILED TTS v5 — Companion script for viet_dubbing.py
 =============================================================
 Workflow:
   Bước 1: Chạy viet_dubbing.py như bình thường
+          → Pass 1 generate TTS (rate=+0%)
+          → Pass 2 regen slow cues (rate=+25%, tạo .fast marker)
           → TTS cache nằm trong thư mục tts_<tên video>/
-          → viet_dubbing v3 đã giữ lại folder này mặc định.
 
-  Bước 2: Chạy script này để retry cue bị lỗi
+  Bước 2: Nếu có cue bị fail (mạng/rate limit), chạy script này:
           python retry_failed_tts.py --srt sub.srt --video video.mp4
+          → Cue có marker .fast → retry với rate=+25% (giữ nhất quán)
+          → Cue không marker → retry với rate=+0% (như Pass 1)
 
   Bước 3: Chạy lại viet_dubbing.py — các file đã có sẽ được
-          skip tự động, chỉ generate cue còn thiếu rồi mix.
+          skip, Pass 2 sẽ detect nếu cue retry mới bị slow rồi
+          tự regen với +25% nếu cần.
 
 Options:
   --srt       subtitle.srt      File SRT gốc (bắt buộc)
@@ -21,6 +25,11 @@ Options:
   --voice     female/male       Giọng đọc (default: female)
   --workers   3                 Số request đồng thời (default: 3)
   --retries   5                 Số lần retry mỗi cue (default: 5)
+
+Changelog v5:
+  - Đồng bộ với viet_dubbing.py Pass 2: tôn trọng marker .fast,
+    cue đã từng được regen với +25% sẽ tiếp tục dùng +25% khi retry
+  - Việc detect slow cue mới được giao cho viet_dubbing.py Pass 2 ở lần chạy sau
 =============================================================
 """
 
@@ -69,6 +78,7 @@ VOICES = {
 }
 
 SPEED            = "+0%"
+SLOW_RATE        = "+25%"  # phải khớp với viet_dubbing.py
 MAX_WORKERS_CAP  = 15
 MIN_RETRIES      = 1
 MAX_RETRIES_CAP  = 20
@@ -83,6 +93,15 @@ TEXT_TRUNCATE    = 65     # độ dài text preview
 def cue_path(tmp_dir: str, cue_index: int) -> str:
     """Tạo path file MP3 cho cue — single source of truth."""
     return os.path.join(tmp_dir, f"cue_{cue_index:04d}.mp3")
+
+
+def cue_has_fast_marker(tmp_dir: str, cue_index: int) -> bool:
+    """
+    Cue đã từng được regen với rate=+25% (có marker .fast)?
+    Marker do viet_dubbing.py Pass 2 tạo ra. Nếu có, retry cũng phải dùng +25%
+    để giữ tính nhất quán.
+    """
+    return os.path.exists(cue_path(tmp_dir, cue_index) + ".fast")
 
 
 def file_exists_and_valid(path: str) -> bool:
@@ -168,11 +187,11 @@ def find_missing_by_scan(cues: list[dict], tmp_dir: str) -> list[dict]:
 # ============================================================
 
 async def tts_one(cue: dict, out_path: str, voice: str,
-                  max_retries: int) -> bool:
+                  max_retries: int, rate: str = SPEED) -> bool:
     """Generate TTS cho 1 cue, có retry với linear backoff."""
     for attempt in range(1, max_retries + 1):
         try:
-            comm = edge_tts.Communicate(text=cue["text"], voice=voice, rate=SPEED)
+            comm = edge_tts.Communicate(text=cue["text"], voice=voice, rate=rate)
             await comm.save(out_path)
             if file_exists_and_valid(out_path):
                 return True
@@ -184,8 +203,13 @@ async def tts_one(cue: dict, out_path: str, voice: str,
 
 
 async def retry_all(failed_cues: list[dict], tmp_dir: str, voice: str,
-                    max_workers: int, max_retries: int) -> tuple[int, int]:
-    """Retry tất cả cue bị lỗi, skip cue đã có file từ lần trước."""
+                    max_workers: int, max_retries: int) -> tuple[int, int, int]:
+    """
+    Retry tất cả cue bị lỗi, skip cue đã có file từ lần trước.
+
+    Returns (success_total, fail_total, fast_count)
+      - fast_count: số cue được retry với rate=+25% do đã có marker .fast
+    """
     os.makedirs(tmp_dir, exist_ok=True)
     semaphore = asyncio.Semaphore(max_workers)
 
@@ -202,15 +226,28 @@ async def retry_all(failed_cues: list[dict], tmp_dir: str, voice: str,
 
     if not to_run:
         console.print("  [green]Tất cả cue đã có file! Không cần generate thêm.[/]")
-        return len(failed_cues), 0
+        return len(failed_cues), 0, 0
+
+    # Đếm trước: bao nhiêu cue có marker .fast → sẽ dùng +25%
+    fast_count = sum(1 for c in to_run if cue_has_fast_marker(tmp_dir, c["index"]))
+    if fast_count:
+        console.print(
+            f"  [yellow]→ {fast_count}/{len(to_run)} cue có marker [bold].fast[/] "
+            f"→ retry với rate={SLOW_RATE}[/]"
+        )
+        console.print(
+            f"  [dim]→ {len(to_run) - fast_count} cue còn lại retry với rate={SPEED}[/]\n"
+        )
 
     success = already_done
     fail = 0
 
     async def _worker(cue: dict) -> bool:
         path = cue_path(tmp_dir, cue["index"])
+        # Chọn rate dựa trên marker — nhất quán với lần regen trước
+        rate = SLOW_RATE if cue_has_fast_marker(tmp_dir, cue["index"]) else SPEED
         async with semaphore:
-            return await tts_one(cue, path, voice, max_retries)
+            return await tts_one(cue, path, voice, max_retries, rate=rate)
 
     with Progress(
         SpinnerColumn(spinner_name="dots", style="cyan"),
@@ -232,7 +269,7 @@ async def retry_all(failed_cues: list[dict], tmp_dir: str, voice: str,
                 fail += 1
             progress.advance(task)
 
-    return success, fail
+    return success, fail, fast_count
 
 
 # ============================================================
@@ -318,7 +355,7 @@ async def main():
 
     # ── HEADER ──────────────────────────────────────────────
     console.print()
-    console.rule("[bold cyan]RETRY FAILED TTS v4[/]")
+    console.rule("[bold cyan]RETRY FAILED TTS v5[/]")
     info = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
     info.add_column(style="dim", width=14)
     info.add_column(style="white")
@@ -358,7 +395,7 @@ async def main():
 
     # ── RETRY ────────────────────────────────────────────────
     t_start = _time.perf_counter()
-    success, fail = await retry_all(
+    success, fail, fast_count = await retry_all(
         failed_cues, tmp_dir, voice_id, workers, retries
     )
     t_total = _time.perf_counter() - t_start
@@ -372,6 +409,8 @@ async def main():
     result.add_column(style="bold white")
     result.add_row("Tổng cue retry", str(len(failed_cues)))
     result.add_row("Thành công",     f"[green]{success}[/]")
+    if fast_count:
+        result.add_row(f"Retry +25%",  f"[yellow]{fast_count}[/]  (cue có marker .fast)")
     result.add_row("Vẫn lỗi",       f"[red]{fail}[/]" if fail else "[dim]0 ✓[/]")
     result.add_row("Thời gian",      f"{t_total:.1f}s")
     result.add_row("Đã lưu vào",    tmp_dir + "/")
@@ -383,7 +422,8 @@ async def main():
         console.print()
         console.print("[cyan]Bước tiếp theo:[/] Chạy lại viet_dubbing.py:")
         console.print(f"[dim]  python viet_dubbing.py --srt {args.srt} --video <video.mp4>[/]")
-        console.print(f"[dim]  → {len(all_cues)} cue sẽ được skip, chỉ mix lại audio[/]")
+        console.print(f"[dim]  → {len(all_cues)} cue sẽ được skip ở Pass 1[/]")
+        console.print(f"[dim]  → Pass 2 sẽ detect nếu cue retry mới bị slow rồi tự regen +25%[/]")
     else:
         console.print(f"[yellow]⚠  Vẫn còn {fail} cue lỗi.[/] Thử:")
         console.print(f"[dim]  --workers 2    Giảm concurrency (hiện: {workers})[/]")

@@ -1,6 +1,6 @@
 """
 =============================================================
-  VIET DUBBING v3.1 — Performance++ Edition
+  VIET DUBBING v3 — Performance Edition
   Auto Vietnamese dubbing from SRT subtitle file
 =============================================================
 Requirements:
@@ -22,27 +22,6 @@ Options:
   --out output.mp4      Output filename (auto-generated if not set)
   --audio-only          Export audio only, no video muxing
   --workers 5           Concurrent TTS requests (default: 5)
-  --speed-up-limit 2.0  Max speed-up ratio (default: 2.0)
-  --slow-down-limit 0.7 Max slow-down ratio (default: 0.7)
-  --no-slow-down        Disable slow-down (v3 behavior)
-
-Changelog v3.2:
-  - PERF: Phase 1 ffprobe song song (ThreadPool) thay vì tuần tự
-    → giảm ~70-80% thời gian detect duration (300 cues: 30s → 5s)
-  - PERF: Phase 3 decode MP3 song song (ThreadPool) thay vì tuần tự
-    → giảm ~50-60% thời gian sync timeline
-  - PERF: Extract BGM thẳng WAV thay vì MP3 → bỏ encode+decode thừa
-  - PERF: Pipe raw audio trực tiếp vào FFmpeg mux thay ghi WAV trung gian
-  - PERF: Tăng default stretch workers 4 → 8
-
-Changelog v3.1:
-  - FIX: Slow-down cho câu TTS ngắn hơn slot → không còn khoảng
-    im lặng thừa giữa các câu (nguyên nhân chính gây nói chậm)
-  - FIX: Bỏ COMPRESS_MIN → mọi câu đều được stretch/compress
-  - NEW: --speed-up-limit / --slow-down-limit tùy chỉnh ngưỡng
-  - NEW: --no-slow-down để tắt slow-down (giữ hành vi v3 cũ)
-  - NEW: Log chi tiết ratio min/max/avg trong SYNC TIMELINE
-  - IMPROVE: Stretch tolerance giảm 5% → 3% cho sync chặt hơn
 
 Changelog v3:
   - Single-decode pipeline: mỗi MP3 chỉ decode 1 lần duy nhất
@@ -164,15 +143,19 @@ VOICES = {
 }
 
 SPEED             = "+0%"
-STRETCH_LIMIT     = 2.0       # max speed-up ratio (default, overridable via --speed-up-limit)
-SLOW_DOWN_LIMIT   = 0.7       # max slow-down ratio (default, overridable via --slow-down-limit)
+STRETCH_LIMIT     = 2.0       # max speed-up ratio trước khi cắt
+COMPRESS_MIN      = 0.6       # ratio dưới ngưỡng này → không stretch
 RETRY_COUNT       = 3
 RETRY_DELAY_SEC   = 1.5
 SAMPLE_RATE       = 24000     # edge-tts output
 CHANNELS          = 1         # mono
 SAMPLE_WIDTH      = 2         # 16-bit
-STRETCH_TOLERANCE = 0.03      # ±3% → skip stretch (tighter than v3's 5%)
+STRETCH_TOLERANCE = 0.05      # ±5% → skip stretch
 MAX_WORKERS_CAP   = 15
+
+# Auto fix cue slow: regen TTS với tốc độ nhanh hơn
+SLOW_RATIO_THRESHOLD = 2.0    # ratio (clip/slot) > 2.0 → cue "slow", cần đọc nhanh hơn
+SLOW_RATE            = "+25%" # rate truyền cho edge-tts khi regen cue slow
 
 
 # ============================================================
@@ -271,11 +254,11 @@ def parse_srt(srt_path: str) -> list[dict]:
 # TTS GENERATION — CONCURRENT
 # ============================================================
 
-async def tts_one(cue: dict, out_path: str, voice: str) -> bool:
+async def tts_one(cue: dict, out_path: str, voice: str, rate: str = SPEED) -> bool:
     """Generate TTS cho 1 cue, có retry với exponential backoff."""
     for attempt in range(1, RETRY_COUNT + 1):
         try:
-            comm = edge_tts.Communicate(text=cue["text"], voice=voice, rate=SPEED)
+            comm = edge_tts.Communicate(text=cue["text"], voice=voice, rate=rate)
             await comm.save(out_path)
             if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                 return True
@@ -345,6 +328,80 @@ async def generate_all_tts(cues: list[dict], out_dir: str, voice: str,
     return all_paths, success, fail, skipped
 
 
+async def regen_slow_cues_fast(cues: list[dict], tts_paths: list[str], voice: str,
+                                max_workers: int = 5) -> tuple[int, int]:
+    """
+    Pass 2: phát hiện cue có TTS dài hơn slot quá nhiều (ratio > SLOW_RATIO_THRESHOLD)
+    rồi regen với SLOW_RATE để rút ngắn audio.
+
+    Dùng marker file `.fast` để đánh dấu cue đã regen — chạy lại sẽ skip.
+
+    Returns: (regen_count, skipped_already_fast)
+    """
+    semaphore = asyncio.Semaphore(max_workers)
+    jobs = []          # (cue, path) cần regen
+    already_fast = 0
+
+    for cue, tts_path in zip(cues, tts_paths):
+        if not os.path.exists(tts_path) or os.path.getsize(tts_path) == 0:
+            continue
+
+        marker = tts_path + ".fast"
+        if os.path.exists(marker):
+            already_fast += 1
+            continue
+
+        clip_ms = ffprobe_duration_ms(tts_path)
+        if clip_ms is None or clip_ms <= 0:
+            continue
+
+        slot_ms = (cue["end"] - cue["start"]) * 1000
+        if slot_ms <= 0:
+            continue
+
+        if (clip_ms / slot_ms) > SLOW_RATIO_THRESHOLD:
+            jobs.append((cue, tts_path))
+
+    if not jobs:
+        if logger:
+            logger.info(f"No slow cues to regen (already fast: {already_fast})")
+        return 0, already_fast
+
+    async def _worker(cue: dict, path: str) -> bool:
+        async with semaphore:
+            ok = await tts_one(cue, path, voice, rate=SLOW_RATE)
+            if ok:
+                try:
+                    Path(path + ".fast").touch()
+                except OSError:
+                    pass
+            return ok
+
+    if logger:
+        logger.info(f"Regenerating {len(jobs)} slow cue(s) with rate={SLOW_RATE} "
+                    f"(already fast: {already_fast})")
+
+    regenerated = 0
+    with Progress(
+        SpinnerColumn(spinner_name="dots", style="yellow"),
+        TextColumn(f"[bold yellow]Regen slow cues ({SLOW_RATE})[/]"),
+        BarColumn(bar_width=32, style="yellow", complete_style="bright_green"),
+        MofNCompleteColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        task = progress.add_task("regen", total=len(jobs))
+        async_tasks = [asyncio.ensure_future(_worker(c, p)) for c, p in jobs]
+        for coro in asyncio.as_completed(async_tasks):
+            if await coro:
+                regenerated += 1
+            progress.advance(task)
+
+    return regenerated, already_fast
+
+
 # ============================================================
 # STRETCH — ThreadPoolExecutor + chained atempo
 # ============================================================
@@ -395,96 +452,45 @@ def _stretch_one_file(src_path: str, clip_ms: float, target_ms: int,
     return None
 
 
-
 # ============================================================
-# BUILD TRACK — parallel pipeline (v3.2)
+# BUILD TRACK — single-decode pipeline
 # ============================================================
-
-def _ffprobe_one(args: tuple[int, str]) -> tuple[int, float | None]:
-    """ffprobe 1 file, trả về (index, duration_ms). Dùng cho ThreadPool."""
-    i, path = args
-    return (i, ffprobe_duration_ms(path))
-
-
-def _decode_one(args: tuple[int, str]) -> tuple[int, np.ndarray | None]:
-    """Decode 1 MP3 → numpy samples. Dùng cho ThreadPool."""
-    i, path = args
-    try:
-        clip = AudioSegment.from_mp3(path)
-        if len(clip) == 0:
-            return (i, None)
-        return (i, audio_to_numpy(clip))
-    except Exception:
-        return (i, None)
-
 
 def build_tts_track(cues: list[dict], tts_paths: list[str], total_ms: int,
-                    max_stretch_workers: int = 8,
-                    speed_up_limit: float = STRETCH_LIMIT,
-                    slow_down_limit: float = SLOW_DOWN_LIMIT,
-                    enable_slow_down: bool = True) -> tuple[AudioSegment, int]:
+                    max_stretch_workers: int = 4) -> tuple[AudioSegment, int]:
     """
-    Build full TTS track (v3.2 — parallel pipeline):
-      Phase 1: ThreadPool ffprobe song song → detect stretch candidates
+    Build full TTS track:
+      Phase 1: ffprobe lấy duration → detect cue cần stretch
       Phase 2: ThreadPool stretch song song
-      Phase 3: ThreadPool decode song song → mix vào numpy array
+      Phase 3: Decode mỗi MP3 đúng 1 lần → mix vào numpy array
     """
     total_samples = int(total_ms * SAMPLE_RATE / 1000)
     track = np.zeros(total_samples, dtype=np.float32)
 
-    # ── Phase 1: Parallel ffprobe lấy duration ─────────────
-    probe_jobs = []
-    for i, tts_path in enumerate(tts_paths):
-        if os.path.exists(tts_path) and os.path.getsize(tts_path) > 0:
-            probe_jobs.append((i, tts_path))
-
+    # ── Phase 1: Detect stretch candidates bằng ffprobe ─────
     clip_durations: dict[int, float] = {}
-    with ThreadPoolExecutor(max_workers=max_stretch_workers) as executor:
-        for i, dur_ms in executor.map(_ffprobe_one, probe_jobs):
-            if dur_ms is not None and dur_ms > 0:
-                clip_durations[i] = dur_ms
-
-    # ── Detect stretch candidates ──────────────────────────
     stretch_jobs = []
-    ratios_for_stats: list[float] = []
 
-    for i, dur_ms in clip_durations.items():
-        cue = cues[i]
+    for i, (cue, tts_path) in enumerate(zip(cues, tts_paths)):
+        if not os.path.exists(tts_path) or os.path.getsize(tts_path) == 0:
+            continue
+
+        clip_ms = ffprobe_duration_ms(tts_path)
+        if clip_ms is None or clip_ms <= 0:
+            continue
+        clip_durations[i] = clip_ms
+
         slot_ms = (cue["end"] - cue["start"]) * 1000
         if slot_ms <= 0:
             continue
 
-        ratio = dur_ms / slot_ms
-        ratios_for_stats.append(ratio)
-
-        # ── SPEED-UP: TTS dài hơn slot → nén lại ──────────
-        if ratio > 1.0:
-            if ratio <= speed_up_limit:
+        ratio = clip_ms / slot_ms
+        if ratio > COMPRESS_MIN:
+            if ratio <= STRETCH_LIMIT:
                 target_ms = int(slot_ms)
             else:
-                target_ms = int(dur_ms / speed_up_limit)
-            stretch_jobs.append((i, tts_paths[i], dur_ms, target_ms, cue["index"]))
-
-        # ── SLOW-DOWN: TTS ngắn hơn slot → kéo dãn ───────
-        elif enable_slow_down and ratio < 1.0:
-            if ratio >= slow_down_limit:
-                target_ms = int(slot_ms)
-            else:
-                target_ms = int(dur_ms / slow_down_limit)
-            stretch_jobs.append((i, tts_paths[i], dur_ms, target_ms, cue["index"]))
-
-    # ── Log ratio stats ────────────────────────────────────
-    if logger and ratios_for_stats:
-        r_min = min(ratios_for_stats)
-        r_max = max(ratios_for_stats)
-        r_avg = sum(ratios_for_stats) / len(ratios_for_stats)
-        sped_up = sum(1 for r in ratios_for_stats if r > (1 + STRETCH_TOLERANCE))
-        slowed  = sum(1 for r in ratios_for_stats if r < (1 - STRETCH_TOLERANCE))
-        ok      = len(ratios_for_stats) - sped_up - slowed
-        logger.info(f"Ratio stats — min={r_min:.2f}  max={r_max:.2f}  avg={r_avg:.2f}")
-        logger.info(f"  Speed-up: {sped_up}  |  Slow-down: {slowed}  |  OK (±{STRETCH_TOLERANCE*100:.0f}%): {ok}")
-        logger.info(f"  Limits: speed-up ≤{speed_up_limit:.1f}x  slow-down ≥{slow_down_limit:.2f}x")
-        logger.info(f"  Stretch jobs queued: {len(stretch_jobs)}")
+                target_ms = int(clip_ms / STRETCH_LIMIT)
+            stretch_jobs.append((i, tts_path, clip_ms, target_ms, cue["index"]))
 
     # ── Phase 2: Stretch song song (ThreadPool — I/O bound) ─
     stretched_paths: dict[int, str] = {}
@@ -505,19 +511,7 @@ def build_tts_track(cues: list[dict], tts_paths: list[str], total_ms: int,
                 except Exception:
                     pass
 
-    # ── Phase 3: Parallel decode + mix vào numpy ───────────
-    decode_jobs = []
-    for i in clip_durations:
-        actual_path = stretched_paths.get(i, tts_paths[i])
-        decode_jobs.append((i, actual_path))
-
-    decoded: dict[int, np.ndarray] = {}
-    with ThreadPoolExecutor(max_workers=max_stretch_workers) as executor:
-        for i, samples in executor.map(_decode_one, decode_jobs):
-            if samples is not None:
-                decoded[i] = samples
-
-    # Mix vào track (tuần tự — numpy ghi khác vùng nên an toàn, rất nhanh)
+    # ── Phase 3: Single decode + mix vào numpy ──────────────
     synced = 0
     with Progress(
         SpinnerColumn(spinner_name="dots2", style="magenta"),
@@ -530,12 +524,24 @@ def build_tts_track(cues: list[dict], tts_paths: list[str], total_ms: int,
     ) as progress:
         task_id = progress.add_task("sync", total=len(cues))
 
-        for i, cue in enumerate(cues):
-            if i not in decoded:
+        for i, (cue, tts_path) in enumerate(zip(cues, tts_paths)):
+            if i not in clip_durations:
                 progress.advance(task_id)
                 continue
 
-            samples = decoded[i]
+            actual_path = stretched_paths.get(i, tts_path)
+            try:
+                clip = AudioSegment.from_mp3(actual_path)
+            except Exception:
+                progress.advance(task_id)
+                continue
+
+            if len(clip) == 0:
+                progress.advance(task_id)
+                continue
+
+            samples = audio_to_numpy(clip)
+
             start_sample = int(cue["start"] * SAMPLE_RATE)
             if start_sample >= total_samples:
                 progress.advance(task_id)
@@ -558,19 +564,17 @@ def build_tts_track(cues: list[dict], tts_paths: list[str], total_ms: int,
     return numpy_to_segment(track), synced
 
 
-
 # ============================================================
 # BGM MIXING — numpy thay pydub .overlay()
 # ============================================================
 
 def extract_bgm(video_path: str, out_path: str) -> bool:
-    """Extract audio từ video → WAV (PCM s16le). Skip nếu đã cache."""
+    """Extract audio từ video → MP3. Skip nếu đã cache."""
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         return True
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
-        "-vn", "-acodec", "pcm_s16le",
-        "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+        "-vn", "-acodec", "mp3", "-ab", "192k",
         out_path, "-loglevel", "error",
     ]
     result = subprocess.run(cmd, capture_output=True)
@@ -580,13 +584,13 @@ def extract_bgm(video_path: str, out_path: str) -> bool:
 def mix_with_bgm(video_path: str, tts_track: AudioSegment,
                  bgm_volume: int, total_ms: int, tmp_dir: str) -> AudioSegment:
     """Mix TTS + BGM bằng numpy — nhanh hơn pydub.overlay() rất nhiều."""
-    bgm_path = os.path.join(tmp_dir, "bgm.wav")
+    bgm_path = os.path.join(tmp_dir, "bgm.mp3")
 
     if not extract_bgm(video_path, bgm_path):
         console.print("  [yellow]No original audio found, using TTS only.[/]")
         return tts_track
 
-    original = AudioSegment.from_wav(bgm_path)
+    original = AudioSegment.from_mp3(bgm_path)
 
     if len(original) < total_ms:
         original = original + AudioSegment.silent(duration=total_ms - len(original))
@@ -609,42 +613,11 @@ def mix_with_bgm(video_path: str, tts_track: AudioSegment,
 
 
 # ============================================================
-# VIDEO MUXING — pipe raw audio (v3.2: bỏ WAV trung gian)
+# VIDEO MUXING — WAV intermediate (encode 1 lần duy nhất)
 # ============================================================
 
-def mux_to_video_piped(video_path: str, audio_segment: AudioSegment,
-                       output_path: str) -> bool:
-    """
-    Mux audio vào video bằng pipe stdin.
-    Gửi raw PCM trực tiếp vào FFmpeg — không cần ghi WAV ra đĩa.
-    """
-    raw_data = (audio_segment
-                .set_frame_rate(SAMPLE_RATE)
-                .set_channels(CHANNELS)
-                .set_sample_width(SAMPLE_WIDTH)
-                .raw_data)
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
-        "-i", "pipe:0",
-        "-c:v", "copy",
-        "-c:a", "aac", "-b:a", "192k",
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-shortest",
-        output_path,
-        "-loglevel", "error",
-    ]
-    try:
-        result = subprocess.run(cmd, input=raw_data, capture_output=True)
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
 def mux_to_video(video_path: str, audio_path: str, output_path: str) -> bool:
-    """Fallback: Mux audio file vào video."""
+    """Mux audio vào video. Audio WAV → encode AAC 1 lần duy nhất."""
     cmd = [
         "ffmpeg", "-y",
         "-i", video_path,
@@ -743,19 +716,10 @@ async def main():
     parser.add_argument("--audio-only", action="store_true")
     parser.add_argument("--workers", required=False, default=5, type=int,
                         help="Concurrent TTS requests (default: 5, max recommended: 10)")
-    parser.add_argument("--speed-up-limit", required=False, default=2.0, type=float,
-                        help="Max speed-up ratio (default: 2.0). Higher = allow faster speech")
-    parser.add_argument("--slow-down-limit", required=False, default=0.7, type=float,
-                        help="Max slow-down ratio (default: 0.7). Lower = allow slower speech")
-    parser.add_argument("--no-slow-down", action="store_true",
-                        help="Disable slow-down stretch (v3 behavior)")
     args = parser.parse_args()
 
     voice_id, voice_label = VOICES[args.voice]
     workers = max(1, min(args.workers, MAX_WORKERS_CAP))
-    speed_up_limit = max(1.1, min(args.speed_up_limit, 4.0))
-    slow_down_limit = max(0.3, min(args.slow_down_limit, 0.95))
-    enable_slow_down = not args.no_slow_down
 
     base_name = args.video if args.video else args.srt
     video_out = args.out if args.out else make_output_name(base_name)
@@ -772,8 +736,6 @@ async def main():
     logger.info(f"BGM volume  : {args.bgm_volume}%")
     logger.info(f"Workers     : {workers} concurrent")
     logger.info(f"Audio only  : {args.audio_only}")
-    logger.info(f"Speed-up    : ≤{speed_up_limit:.1f}x")
-    logger.info(f"Slow-down   : ≥{slow_down_limit:.2f}x (enabled={enable_slow_down})")
     logger.info(f"TTS cache   : {tmp_dir}/")
     logger.info(f"Output video: {video_out}")
     logger.info(f"Output audio: {audio_out}")
@@ -781,7 +743,7 @@ async def main():
 
     # ── HEADER ──────────────────────────────────────────────
     console.print()
-    console.rule("[bold cyan]VIET DUBBING v3.1 — Speed Normalization Edition[/]")
+    console.rule("[bold cyan]VIET DUBBING v3 — Performance Edition[/]")
 
     info = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
     info.add_column(style="dim", width=14)
@@ -791,12 +753,6 @@ async def main():
     info.add_row("Voice",      voice_label)
     info.add_row("BGM volume", f"{args.bgm_volume}%")
     info.add_row("Workers",    f"{workers} concurrent")
-    speed_info = f"↑ ≤{speed_up_limit:.1f}x"
-    if enable_slow_down:
-        speed_info += f"  ↓ ≥{slow_down_limit:.2f}x"
-    else:
-        speed_info += "  ↓ disabled"
-    info.add_row("Speed range", speed_info)
     info.add_row("TTS dir",    tmp_dir + "/")
     info.add_row("Output",     video_out)
     console.print(info)
@@ -851,19 +807,36 @@ async def main():
     console.print(summary)
     console.print()
 
+    # ── REGEN SLOW CUES (Pass 2 — fix cue ratio > 2.0 với +25%) ────
+    logger.section("REGEN SLOW CUES")
+    logger.info(f"Pass 2: detect cue ratio > {SLOW_RATIO_THRESHOLD} → regen với rate={SLOW_RATE}")
+    regenerated, already_fast = await regen_slow_cues_fast(
+        cues, tts_paths, voice_id, max_workers=workers
+    )
+    t_regen = _time.perf_counter()
+    if regenerated > 0 or already_fast > 0:
+        regen_summary = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        regen_summary.add_column(style="dim", width=20)
+        regen_summary.add_column()
+        regen_summary.add_row("Regenerated",  f"[yellow]{regenerated}[/]  (rate={SLOW_RATE})")
+        regen_summary.add_row("Already fast", f"[cyan]{already_fast}[/]  (skipped)")
+        regen_summary.add_row("Regen time",   f"[dim]{format_duration(t_regen - t_tts)}[/]")
+        console.print(regen_summary)
+        console.print()
+        logger.success(f"Regen done in {format_duration(t_regen - t_tts)} "
+                       f"— regenerated={regenerated}, already_fast={already_fast}")
+    else:
+        console.print("[dim]  No slow cues — nothing to regen.[/]\n")
+        logger.info("No slow cues detected")
+
     # ── SYNC TIMELINE (single-decode + parallel stretch) ────
     logger.section("SYNC TIMELINE")
     logger.info("Building TTS track: ffprobe detect → ThreadPool stretch → single-decode mix")
-    tts_track, synced = build_tts_track(
-        cues, tts_paths, total_ms,
-        speed_up_limit=speed_up_limit,
-        slow_down_limit=slow_down_limit,
-        enable_slow_down=enable_slow_down,
-    )
+    tts_track, synced = build_tts_track(cues, tts_paths, total_ms)
     t_sync = _time.perf_counter()
     console.print(f"\n[green]✓[/] Synced [bold]{synced}[/] segments  "
-                  f"[dim]({format_duration(t_sync - t_tts)})[/]\n")
-    logger.success(f"Timeline sync done in {format_duration(t_sync - t_tts)} — {synced} segments synced")
+                  f"[dim]({format_duration(t_sync - t_regen)})[/]\n")
+    logger.success(f"Timeline sync done in {format_duration(t_sync - t_regen)} — {synced} segments synced")
 
     # ── MIX WITH BGM (numpy) ────────────────────────────────
     final_track = tts_track
@@ -895,18 +868,26 @@ async def main():
     console.print(f"[green]✓[/] Audio exported: [bold]{export_path}[/]\n")
     logger.success(f"Audio exported in {format_duration(t_export - t_before_export)} → {export_path}")
 
-    # ── MUX VIDEO (pipe raw audio → AAC — no temp WAV) ──────
+    # ── MUX VIDEO (WAV intermediate → AAC encode 1 lần) ────
     if not args.audio_only and args.video and os.path.exists(args.video):
         logger.section("MUX VIDEO")
-        logger.info(f"Muxing: pipe PCM → AAC → {video_out}")
+        logger.info(f"Muxing: WAV → AAC → {video_out}")
+
+        wav_path = os.path.join(tmp_dir, "mux_tmp.wav")
+        final_track.export(wav_path, format="wav")
 
         est_mux = max(10, total_ms / 1000 * 0.03)
         ok = timed_progress(
             "Muxing video", "yellow",
-            lambda: mux_to_video_piped(args.video, final_track, video_out),
+            lambda: mux_to_video(args.video, wav_path, video_out),
             estimated_sec=est_mux,
         )
         t_mux = _time.perf_counter()
+
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
 
         if ok:
             console.print(f"[green]✓[/] Video muxed: [bold]{video_out}[/]")
@@ -948,14 +929,11 @@ async def main():
 
     console.print()
     console.print("[dim]Tips:[/]")
-    console.print("[dim]  --workers 8             Increase TTS concurrency (default: 5)[/]")
-    console.print("[dim]  --voice male            Switch to male voice[/]")
-    console.print("[dim]  --voice female          Switch to female voice (default)[/]")
-    console.print("[dim]  --bgm-volume 80         Reduce BGM to 80%[/]")
-    console.print("[dim]  --bgm-volume 0          Mute original audio completely[/]")
-    console.print("[dim]  --speed-up-limit 2.5    Allow faster compression (default: 2.0)[/]")
-    console.print("[dim]  --slow-down-limit 0.6   Allow more stretching (default: 0.7)[/]")
-    console.print("[dim]  --no-slow-down          Disable slow-down (v3 behavior)[/]")
+    console.print("[dim]  --workers 8           Increase TTS concurrency (default: 5)[/]")
+    console.print("[dim]  --voice male          Switch to male voice[/]")
+    console.print("[dim]  --voice female        Switch to female voice (default)[/]")
+    console.print("[dim]  --bgm-volume 80       Reduce BGM to 80%[/]")
+    console.print("[dim]  --bgm-volume 0        Mute original audio completely[/]")
     console.print()
 
     play_done_sound()
